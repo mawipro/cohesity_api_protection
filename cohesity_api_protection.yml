@@ -1,0 +1,464 @@
+---
+- name: Assign a VMware VM to a Cohesity daily protection group
+  hosts: localhost
+  gather_facts: true
+
+  vars:
+    # Shared workflow inputs. These are normally defined as null in the
+    # central defaults file and overridden by preceding roles.
+    dcname: null
+    actualservername: null
+    failmail: null
+    sucmail: null
+    failmsg: "nomsg"
+    nomsg: "nomsg"
+
+    # Add these variables to the shared defaults list because this playbook
+    # creates/returns them.
+    cohesity_api_url: null
+    cohesity_cluster_code: null
+    cohesity_vcenter_code: null
+    cohesity_job_prefix: null
+    cohesity_job_name: null
+    cohesity_job_id: null
+    cohesity_policy_name: null
+    cohesity_policy_id: null
+    cohesity_storage_domain_name: "DefaultStorageDomain"
+    cohesity_storage_domain_id: null
+    cohesity_vm_source_id: null
+    cohesity_parent_source_id: null
+    cohesity_object_count_before: null
+    cohesity_object_count_after: null
+    cohesity_group_created: false
+    cohesity_validation_completed: false
+
+    # DC1 URL was supplied. Replace the DC2 placeholder with the confirmed
+    # Cohesity cluster API FQDN before running a DC2 request.
+    cohesity_dc_mapping:
+      DC1:
+        api_url: "https://chzahcohclt01.balgroupit.com"
+        cluster_code: "CHZAHCOHCLP01"
+        vcenter_code: "VC1"
+      DC2:
+        api_url: null
+        cluster_code: "CHZAHCOHCLP02"
+        vcenter_code: "VC2"
+
+    # Must match an existing Cohesity policy. Override from shared defaults,
+    # inventory, or AAP extra vars after confirming the exact policy name.
+    cohesity_policy_name_by_dc:
+      DC1: null
+      DC2: null
+
+    cohesity_auth_domain: "LOCAL"
+    cohesity_validate_certs: true
+    cohesity_max_objects_per_group: 30
+
+    cohesity_auth_endpoint: "/irisservices/api/v1/public/accessTokens"
+    cohesity_jobs_endpoint: "/irisservices/api/v1/public/protectionJobs"
+    cohesity_sources_endpoint: "/irisservices/api/v1/public/protectionSources"
+    cohesity_policies_endpoint: "/irisservices/api/v1/public/protectionPolicies"
+    cohesity_storage_domains_endpoint: "/irisservices/api/v1/public/viewBoxes"
+
+  tasks:
+    - name: Configure Cohesity protection for the provisioned VM
+      block:
+        - name: Define credential and normalized workflow variables
+          ansible.builtin.set_fact:
+            dcname: "{{ dcname | string | trim | upper }}"
+            actualservername: "{{ actualservername | string | trim }}"
+            cohesity_username: "{{ lookup('env', 'COHESITY_USERNAME') }}"
+            cohesity_password: "{{ lookup('env', 'COHESITY_PASSWORD') }}"
+          no_log: true
+
+        - name: Debug input variables
+          ansible.builtin.debug:
+            msg:
+              dcname: "{{ dcname }}"
+              actualservername: "{{ actualservername }}"
+              cohesity_username_defined: "{{ cohesity_username | length > 0 }}"
+              cohesity_password_defined: "{{ cohesity_password | length > 0 }}"
+              cohesity_storage_domain_name: "{{ cohesity_storage_domain_name }}"
+              cohesity_max_objects_per_group: "{{ cohesity_max_objects_per_group }}"
+
+        - name: Pre-Validations Tasks | Validate shared workflow inputs
+          ansible.builtin.assert:
+            that:
+              - dcname in cohesity_dc_mapping
+              - actualservername | length > 0
+              - cohesity_username | length > 0
+              - cohesity_password | length > 0
+            fail_msg: >-
+              dcname must be DC1 or DC2, actualservername must be populated by
+              the previous role, and the AAP Cohesity credential must inject
+              COHESITY_USERNAME and COHESITY_PASSWORD.
+          no_log: true
+
+        - name: Actual Logic | Select DC-specific API configuration
+          ansible.builtin.set_fact:
+            cohesity_api_url: "{{ cohesity_dc_mapping[dcname].api_url }}"
+            cohesity_cluster_code: "{{ cohesity_dc_mapping[dcname].cluster_code }}"
+            cohesity_vcenter_code: "{{ cohesity_dc_mapping[dcname].vcenter_code }}"
+            cohesity_policy_name: "{{ cohesity_policy_name_by_dc[dcname] }}"
+
+        - name: Actual Logic | Build protection-group prefix
+          ansible.builtin.set_fact:
+            cohesity_job_prefix: >-
+              {{ cohesity_cluster_code }}_VM-SNAP_{{ cohesity_vcenter_code }}_{{ dcname }}
+
+        - name: Pre-Validations Tasks | Validate DC-specific configuration
+          ansible.builtin.assert:
+            that:
+              - cohesity_api_url is string
+              - cohesity_api_url | length > 0
+              - cohesity_policy_name is string
+              - cohesity_policy_name | length > 0
+              - cohesity_storage_domain_name | length > 0
+            fail_msg: >-
+              The API URL, policy name, or storage-domain name is not configured
+              for {{ dcname }}. The DC2 API URL and both exact policy names must
+              be confirmed before the corresponding request can run.
+
+        - name: Actual Logic | Obtain Cohesity access token
+          ansible.builtin.uri:
+            url: "{{ cohesity_api_url }}{{ cohesity_auth_endpoint }}"
+            method: POST
+            body_format: json
+            body:
+              username: "{{ cohesity_username }}"
+              password: "{{ cohesity_password }}"
+              domain: "{{ cohesity_auth_domain }}"
+            validate_certs: "{{ cohesity_validate_certs }}"
+            return_content: true
+            status_code: [200, 201]
+          register: cohesity_auth_response
+          no_log: true
+
+        - name: Actual Logic | Persist Cohesity access token
+          ansible.builtin.set_fact:
+            cohesity_access_token: >-
+              {{ cohesity_auth_response.json.accessToken |
+                 default(cohesity_auth_response.json.access_token | default('')) }}
+          no_log: true
+
+        - name: Post-Validation Tasks | Validate access token
+          ansible.builtin.assert:
+            that:
+              - cohesity_access_token | length > 0
+            fail_msg: "Cohesity authentication returned no access token."
+          no_log: true
+
+        - name: Actual Logic | Read policies, storage domains, sources and jobs
+          ansible.builtin.uri:
+            url: "{{ item.url }}"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ cohesity_access_token }}"
+              Accept: "application/json"
+            validate_certs: "{{ cohesity_validate_certs }}"
+            return_content: true
+            status_code: 200
+          loop:
+            - name: policies
+              url: "{{ cohesity_api_url }}{{ cohesity_policies_endpoint }}"
+            - name: storage_domains
+              url: "{{ cohesity_api_url }}{{ cohesity_storage_domains_endpoint }}"
+            - name: sources
+              url: "{{ cohesity_api_url }}{{ cohesity_sources_endpoint }}"
+            - name: jobs
+              url: "{{ cohesity_api_url }}{{ cohesity_jobs_endpoint }}"
+          loop_control:
+            label: "{{ item.name }}"
+          register: cohesity_lookup_results
+          no_log: true
+
+        - name: Actual Logic | Extract API lookup responses
+          ansible.builtin.set_fact:
+            cohesity_policies: "{{ cohesity_lookup_results.results[0].json }}"
+            cohesity_storage_domains: "{{ cohesity_lookup_results.results[1].json }}"
+            cohesity_source_roots: "{{ cohesity_lookup_results.results[2].json }}"
+            cohesity_all_jobs: "{{ cohesity_lookup_results.results[3].json }}"
+
+        - name: Actual Logic | Resolve protection policy
+          ansible.builtin.set_fact:
+            cohesity_matching_policies: >-
+              {{ cohesity_policies | selectattr('name', 'defined') |
+                 selectattr('name', 'equalto', cohesity_policy_name) | list }}
+
+        - name: Actual Logic | Resolve storage domain
+          ansible.builtin.set_fact:
+            cohesity_matching_storage_domains: >-
+              {{ cohesity_storage_domains | selectattr('name', 'defined') |
+                 selectattr('name', 'equalto', cohesity_storage_domain_name) | list }}
+
+        - name: Actual Logic | Flatten registered protection-source tree
+          ansible.builtin.set_fact:
+            cohesity_flat_sources: >-
+              {{ query('ansible.builtin.subelements', cohesity_source_roots,
+                       'nodes', {'skip_missing': True}) | map('last') | list }}
+
+        - name: Actual Logic | Include source roots in searchable source list
+          ansible.builtin.set_fact:
+            cohesity_flat_sources: "{{ cohesity_source_roots + cohesity_flat_sources }}"
+
+        - name: Actual Logic | Resolve target VM source by exact name
+          ansible.builtin.set_fact:
+            cohesity_matching_vm_sources: >-
+              {{ cohesity_flat_sources | selectattr('protectionSource.name', 'defined') |
+                 selectattr('protectionSource.name', 'equalto', actualservername) | list }}
+
+        - name: Post-Validation Tasks | Validate unique policy, storage and VM
+          ansible.builtin.assert:
+            that:
+              - cohesity_matching_policies | length == 1
+              - cohesity_matching_storage_domains | length == 1
+              - cohesity_matching_vm_sources | length == 1
+            fail_msg: >-
+              Expected exactly one matching policy, storage domain and VMware
+              source. Found policies={{ cohesity_matching_policies | length }},
+              storage_domains={{ cohesity_matching_storage_domains | length }},
+              VM_sources={{ cohesity_matching_vm_sources | length }}.
+
+        - name: Actual Logic | Persist resolved Cohesity IDs
+          ansible.builtin.set_fact:
+            cohesity_policy_id: "{{ cohesity_matching_policies[0].id }}"
+            cohesity_storage_domain_id: "{{ cohesity_matching_storage_domains[0].id }}"
+            cohesity_vm_source_id: >-
+              {{ cohesity_matching_vm_sources[0].protectionSource.id }}
+            cohesity_parent_source_id: >-
+              {{ cohesity_matching_vm_sources[0].protectionSource.parentId }}
+
+        - name: Actual Logic | Select daily protection groups for this DC
+          ansible.builtin.set_fact:
+            cohesity_matching_jobs: >-
+              {{ cohesity_all_jobs | selectattr('name', 'defined') |
+                 selectattr('name', 'match', '^' ~ cohesity_job_prefix ~ '_[0-2][0-9][0-5][0-9]_Daily$') |
+                 list }}
+
+        - name: Actual Logic | Initialize protection-group inventory
+          ansible.builtin.set_fact:
+            cohesity_job_inventory: []
+            cohesity_existing_vm_jobs: []
+
+        # HOW DO WE KNOW THAT A GROUP CONTAINS 30 OBJECTS?
+        # For these static VMware protection groups, GET /protectionJobs returns
+        # sourceIds, the explicit Cohesity object IDs assigned to the group.
+        # The object count is therefore: item.sourceIds | length.
+        # A group is full when that count is >= cohesity_max_objects_per_group.
+        # This must be validated against a sanitized response from your cluster.
+        # If a job uses auto-protection, tags, or container-level selection,
+        # sourceIds may not equal the effective protected VM count and this
+        # allocation method must not be used without an expansion API/query.
+        - name: Actual Logic | Count explicitly assigned objects in each group
+          ansible.builtin.set_fact:
+            cohesity_job_inventory: >-
+              {{ cohesity_job_inventory + [
+                   {
+                     'id': item.id,
+                     'name': item.name,
+                     'object_count': (item.sourceIds | default([]) | length),
+                     'source_ids': (item.sourceIds | default([])),
+                     'job_object': item
+                   }
+                 ] }}
+          loop: "{{ cohesity_matching_jobs }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Actual Logic | Detect whether VM is already protected
+          ansible.builtin.set_fact:
+            cohesity_existing_vm_jobs: "{{ cohesity_existing_vm_jobs + [item] }}"
+          loop: "{{ cohesity_job_inventory }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when: cohesity_vm_source_id | int in (item.source_ids | map('int') | list)
+
+        - name: Actual Logic | Select lowest-time group having free capacity
+          ansible.builtin.set_fact:
+            cohesity_available_jobs: >-
+              {{ cohesity_job_inventory |
+                 selectattr('object_count', 'lt', cohesity_max_objects_per_group | int) |
+                 sort(attribute='name') | list }}
+
+        - name: Actual Logic | Reuse existing VM assignment idempotently
+          ansible.builtin.set_fact:
+            cohesity_selected_job: "{{ cohesity_existing_vm_jobs[0] }}"
+            cohesity_job_name: "{{ cohesity_existing_vm_jobs[0].name }}"
+            cohesity_job_id: "{{ cohesity_existing_vm_jobs[0].id }}"
+            cohesity_object_count_before: "{{ cohesity_existing_vm_jobs[0].object_count }}"
+            cohesity_group_created: false
+            cohesity_skip_change: true
+          when: cohesity_existing_vm_jobs | length > 0
+
+        - name: Actual Logic | Select existing group having capacity
+          ansible.builtin.set_fact:
+            cohesity_selected_job: "{{ cohesity_available_jobs[0] }}"
+            cohesity_job_name: "{{ cohesity_available_jobs[0].name }}"
+            cohesity_job_id: "{{ cohesity_available_jobs[0].id }}"
+            cohesity_object_count_before: "{{ cohesity_available_jobs[0].object_count }}"
+            cohesity_group_created: false
+            cohesity_skip_change: false
+          when:
+            - cohesity_existing_vm_jobs | length == 0
+            - cohesity_available_jobs | length > 0
+
+        - name: Actual Logic | Generate current-time group name when none has capacity
+          ansible.builtin.set_fact:
+            cohesity_job_name: >-
+              {{ cohesity_job_prefix }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}_Daily
+            cohesity_object_count_before: 0
+            cohesity_group_created: true
+            cohesity_skip_change: false
+          when:
+            - cohesity_existing_vm_jobs | length == 0
+            - cohesity_available_jobs | length == 0
+
+        - name: Pre-Validations Tasks | Prevent time-name collision
+          ansible.builtin.assert:
+            that:
+              - cohesity_all_jobs | selectattr('name', 'defined') |
+                selectattr('name', 'equalto', cohesity_job_name) | list | length == 0
+            fail_msg: >-
+              A protection group named {{ cohesity_job_name }} already exists but
+              was not selected. Run again with a unique HHMM value or inspect it.
+          when: cohesity_group_created | bool
+
+        - name: Actual Logic | Update existing protection group with VM
+          ansible.builtin.uri:
+            url: "{{ cohesity_api_url }}{{ cohesity_jobs_endpoint }}/{{ cohesity_job_id }}"
+            method: PUT
+            headers:
+              Authorization: "Bearer {{ cohesity_access_token }}"
+              Accept: "application/json"
+              Content-Type: "application/json"
+            body_format: json
+            body: >-
+              {{ cohesity_selected_job.job_object |
+                 combine({'sourceIds':
+                   ((cohesity_selected_job.source_ids | map('int') | list) +
+                    [cohesity_vm_source_id | int] | unique)}) }}
+            validate_certs: "{{ cohesity_validate_certs }}"
+            return_content: true
+            status_code: [200, 201]
+          register: cohesity_update_response
+          no_log: true
+          when:
+            - not cohesity_group_created | bool
+            - not cohesity_skip_change | bool
+
+        - name: Actual Logic | Create a new current-time protection group
+          ansible.builtin.uri:
+            url: "{{ cohesity_api_url }}{{ cohesity_jobs_endpoint }}"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ cohesity_access_token }}"
+              Accept: "application/json"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              name: "{{ cohesity_job_name }}"
+              description: >-
+                Managed by Ansible Automation Platform for {{ actualservername }}
+              environment: "kVMware"
+              policyId: "{{ cohesity_policy_id }}"
+              viewBoxId: "{{ cohesity_storage_domain_id }}"
+              parentSourceId: "{{ cohesity_parent_source_id | int }}"
+              sourceIds:
+                - "{{ cohesity_vm_source_id | int }}"
+              timezone: "Europe/Warsaw"
+              startTime:
+                hour: "{{ ansible_date_time.hour | int }}"
+                minute: "{{ ansible_date_time.minute | int }}"
+            validate_certs: "{{ cohesity_validate_certs }}"
+            return_content: true
+            status_code: [200, 201]
+          register: cohesity_create_response
+          no_log: true
+          when: cohesity_group_created | bool
+
+        - name: Actual Logic | Persist newly created job ID
+          ansible.builtin.set_fact:
+            cohesity_job_id: "{{ cohesity_create_response.json.id }}"
+          when: cohesity_group_created | bool
+
+        - name: Post-Validation Tasks | Read selected protection group
+          ansible.builtin.uri:
+            url: "{{ cohesity_api_url }}{{ cohesity_jobs_endpoint }}/{{ cohesity_job_id }}"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ cohesity_access_token }}"
+              Accept: "application/json"
+            validate_certs: "{{ cohesity_validate_certs }}"
+            return_content: true
+            status_code: 200
+          register: cohesity_validation_response
+          until:
+            - cohesity_vm_source_id | int in
+              (cohesity_validation_response.json.sourceIds | default([]) | map('int') | list)
+          retries: 6
+          delay: 10
+          no_log: true
+
+        - name: Post-Validation Tasks | Validate membership and capacity
+          ansible.builtin.set_fact:
+            cohesity_object_count_after: >-
+              {{ cohesity_validation_response.json.sourceIds | default([]) | length }}
+            cohesity_validation_completed: true
+            failmail: false
+            sucmail: true
+            failmsg: "{{ nomsg }}"
+
+        - name: Post-Validation Tasks | Enforce object limit
+          ansible.builtin.assert:
+            that:
+              - cohesity_object_count_after | int <= cohesity_max_objects_per_group | int
+            fail_msg: >-
+              Protection group {{ cohesity_job_name }} contains
+              {{ cohesity_object_count_after }} explicitly assigned objects,
+              exceeding the configured limit of {{ cohesity_max_objects_per_group }}.
+
+        - name: Debug output variables
+          ansible.builtin.debug:
+            msg:
+              dcname: "{{ dcname }}"
+              actualservername: "{{ actualservername }}"
+              cohesity_api_url: "{{ cohesity_api_url }}"
+              cohesity_job_name: "{{ cohesity_job_name }}"
+              cohesity_job_id: "{{ cohesity_job_id }}"
+              cohesity_policy_name: "{{ cohesity_policy_name }}"
+              cohesity_object_count_before: "{{ cohesity_object_count_before }}"
+              cohesity_object_count_after: "{{ cohesity_object_count_after }}"
+              cohesity_group_created: "{{ cohesity_group_created }}"
+              cohesity_validation_completed: "{{ cohesity_validation_completed }}"
+              failmail: "{{ failmail }}"
+              sucmail: "{{ sucmail }}"
+              failmsg: "{{ failmsg }}"
+
+      rescue:
+        - name: Persist failure control flags
+          ansible.builtin.set_fact:
+            failmsg: >-
+              {{
+                failmsg
+                if (failmsg | default(nomsg)) != nomsg
+                else 'failed to configure Cohesity protection for '
+                  ~ (actualservername | default('unknown server')) ~ ': '
+                  ~ (ansible_failed_result.msg | default('unknown error'))
+              }}
+            failmail: true
+            sucmail: false
+            cohesity_validation_completed: false
+
+        - name: Debug failure output variables
+          ansible.builtin.debug:
+            msg:
+              dcname: "{{ dcname | default(null) }}"
+              actualservername: "{{ actualservername | default(null) }}"
+              cohesity_job_name: "{{ cohesity_job_name | default(null) }}"
+              failmail: "{{ failmail }}"
+              sucmail: "{{ sucmail }}"
+              failmsg: "{{ failmsg }}"
+
+        - name: Stop Cohesity workflow
+          ansible.builtin.fail:
+            msg: "{{ failmsg }}"
