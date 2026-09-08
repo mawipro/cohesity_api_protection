@@ -4,8 +4,8 @@
   gather_facts: false
 
   vars:
-    cohesity_api_url: "https://chzahcohclt01.balgroupit.com"
-    cohesity_auth_domain: "LOCAL"
+    cohesity_api_url: "https://chzahcohclp01.balgroupit.com"
+    cohesity_auth_domain: "balgroupit.com"
     cohesity_validate_certs: true
     cohesity_auth_endpoint: "/irisservices/api/v1/public/accessTokens"
     cohesity_jobs_endpoint: "/irisservices/api/v1/public/protectionJobs"
